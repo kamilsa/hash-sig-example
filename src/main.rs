@@ -1,108 +1,242 @@
-// Corrected crate name: hashashig instead of hash_sig
+use std::{fs, io::Write, path::PathBuf};
+
+use bincode::serde::{decode_from_slice, encode_to_vec};
+use clap::{Parser, Subcommand};
 use hashsig::{
     MESSAGE_LENGTH,
     signature::{SignatureScheme, SignatureSchemeSecretKey,
-        // Using a specific scheme instantiation from the library
         generalized_xmss::instantiations_poseidon_top_level::lifetime_2_to_the_32::hashing_optimized::SIGTopLevelTargetSumLifetime32Dim64Base8,
     },
 };
-// Re-added Rng trait import
-use rand::Rng;
+use hex::{decode as hex_decode, encode as hex_encode};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-
-// Define the type alias for the signature scheme for convenience
+// Use a concrete scheme alias for convenience
 type MySigScheme = SIGTopLevelTargetSumLifetime32Dim64Base8;
 
+#[derive(Serialize, Deserialize)]
+struct SigEnvelope<SigT> {
+    epoch: u32,
+    signature: SigT,
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "hash-sig-example", version, about = "Hash-based signature CLI (poseidon, lifetime 2^32)")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Generate a new keypair and write hex-encoded files to --output dir
+    Generate {
+        /// Output directory; two files will be created: pubkey.hex, secret.hex
+        #[arg(long)]
+        output: PathBuf,
+        /// Optional: activation epoch (default: 0)
+        #[arg(long, default_value_t = 0)]
+        activation_epoch: usize,
+        /// Optional: number of active epochs. Default keeps it small for quick generation (1024)
+        #[arg(long, default_value_t = 1usize << 10)]
+        num_active_epochs: usize,
+    },
+    /// Sign a message string at a given epoch using a secret key file (hex-encoded)
+    Sign {
+        /// Path to secret key file (hex without leading 0x)
+        #[arg(long, value_name = "PATH")]
+        key: PathBuf,
+        /// Arbitrary message string to sign (will be hashed to 32 bytes with SHA-256)
+        #[arg(long)]
+        message: String,
+        /// Epoch number to sign for
+        #[arg(long)]
+        epoch: u32,
+        /// Output path to write the signature (hex without leading 0x)
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+    },
+    /// Verify a signature file against a message string and public key file
+    Verify {
+        /// Path to signature file (hex without leading 0x). Contains the signature and epoch.
+        #[arg(long, value_name = "PATH")]
+        signature: PathBuf,
+        /// Arbitrary message string that was signed (will be hashed to 32 bytes with SHA-256)
+        #[arg(long)]
+        message: String,
+        /// Path to public key file (hex without leading 0x)
+        #[arg(long, value_name = "PATH")]
+        pubkey: PathBuf,
+    },
+}
+
 fn main() {
-    // This constant is derived from the chosen signature scheme's name (...Lifetime32...)
-    const LOG_LIFETIME: usize = 32;
+    let cli = Cli::parse();
 
-    // Use the new rand API name `rng` instead of the deprecated `thread_rng`
+    match cli.command {
+        Commands::Generate { output, activation_epoch, num_active_epochs } => {
+            cmd_generate(output, activation_epoch, num_active_epochs);
+        }
+        Commands::Sign { key, message, epoch, output } => {
+            if let Err(e) = cmd_sign(key, message, epoch, output) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Verify { signature, message, pubkey } => {
+            if let Err(e) = cmd_verify(signature, message, pubkey) {
+                eprintln!("Error: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+}
+
+fn cmd_generate(output_dir: PathBuf, activation_epoch: usize, num_active_epochs: usize) {
+    if let Err(e) = fs::create_dir_all(&output_dir) {
+        eprintln!("Failed to create output directory: {e}");
+        std::process::exit(1);
+    }
+
     let mut rng = rand::rng();
+    println!("Generating key pair (activation={activation_epoch}, active_epochs={num_active_epochs})...");
+    let (pk, sk) = MySigScheme::key_gen(&mut rng, activation_epoch, num_active_epochs);
 
-    println!("Generating key pair...");
-    // Generate keys for the full lifetime, though you could specify a shorter active period
-    // Note: Key generation can be slow, especially for large lifetimes.
-    // For faster testing/examples, consider using a scheme with a smaller LOG_LIFETIME if available.
-    let activation_epoch: usize = 0;
-    // Using a smaller number of active epochs for faster key generation in this example
-    let num_active_epochs: usize = 1 << 10; // e.g., 1024 epochs instead of full 2^32
+    let config = bincode::config::standard();
 
-    let (pk, mut sk) = MySigScheme::key_gen(&mut rng, activation_epoch, num_active_epochs);
-    println!("Key pair generated.");
-    println!("Activation interval: {:?}", sk.get_activation_interval());
-    println!("Initially prepared interval: {:?}", sk.get_prepared_interval());
+    // Serialize and hex-encode
+    let pk_bytes = encode_to_vec(&pk, config).expect("Bincode serialize pk should succeed");
+    let sk_bytes = encode_to_vec(&sk, config).expect("Bincode serialize sk should succeed");
 
-    // --- Signing ---
-    // Use the new `random` method name as suggested by the deprecation message
-    let message: [u8; MESSAGE_LENGTH] = rng.random(); // Generate a random message
-    let epoch: u32 = 15; // Choose an epoch within the active range
+    let pk_hex = hex_encode(pk_bytes);
+    let sk_hex = hex_encode(sk_bytes);
 
-    println!("\nSigning message at epoch {}...", epoch);
+    let pk_path = output_dir.join("pubkey.hex");
+    let sk_path = output_dir.join("secret.hex");
 
-    // Ensure the secret key is prepared for the target epoch
-    // In a real application, advance_preparation might happen proactively in the background.
-    let mut iterations = 0;
-    // Calculate a reasonable safety limit for iterations
-    let log_lifetime_half = LOG_LIFETIME / 2;
-    // Estimate needed advances based on the tree structure, with a small buffer.
-    let max_iterations = if epoch < (1 << log_lifetime_half) {
-        1
-    } else {
-        (epoch >> log_lifetime_half) + 2
-    };
+    if let Err(e) = write_string_file(&pk_path, &pk_hex) {
+        eprintln!("Failed to write public key: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = write_string_file(&sk_path, &sk_hex) {
+        eprintln!("Failed to write secret key: {e}");
+        std::process::exit(1);
+    }
 
-    while !sk.get_prepared_interval().contains(&(epoch as u64)) && iterations < max_iterations {
-        println!("Advancing key preparation... Current prepared interval: {:?}", sk.get_prepared_interval());
-        sk.advance_preparation();
-        iterations += 1;
+    println!("Wrote:\n- {}\n- {}", pk_path.display(), sk_path.display());
+}
+
+fn cmd_sign(key_path: PathBuf, message_str: String, epoch: u32, output_path: PathBuf) -> Result<(), String> {
+    // Read and decode secret key
+    let sk_hex = read_string_file(&key_path).map_err(|e| format!("Failed to read key file: {e}"))?;
+    let sk_bytes = parse_hex(&sk_hex).map_err(|e| format!("Secret key hex decode failed: {e}"))?;
+
+    let config = bincode::config::standard();
+    let (mut sk, _): (<MySigScheme as SignatureScheme>::SecretKey, _) =
+        decode_from_slice(&sk_bytes, config).map_err(|e| format!("Bincode decode secret key failed: {e}"))?;
+
+    // Convert message string to 32-byte message via SHA-256
+    let message = message_to_bytes(&message_str);
+
+    // Check activation interval before trying to prepare
+    let activation = sk.get_activation_interval();
+    if !(activation.start <= epoch as u64 && (epoch as u64) < activation.end) {
+        return Err(format!(
+            "Epoch {epoch} outside of activation interval [{}, {})",
+            activation.start, activation.end
+        ));
+    }
+
+    // Ensure the secret key is prepared for the target epoch, advancing if possible
+    if !sk.get_prepared_interval().contains(&(epoch as u64)) {
+        // Try to advance until the interval changes no further or we cover the epoch
+        let mut safety = 0usize;
+        loop {
+            let before = sk.get_prepared_interval();
+            if before.contains(&(epoch as u64)) { break; }
+            sk.advance_preparation();
+            let after = sk.get_prepared_interval();
+            if after.start == before.start && after.end == before.end {
+                break; // cannot advance further
+            }
+            safety += 1;
+            if safety > 1_000_000 { // extreme safety cap
+                break;
+            }
+        }
     }
 
     if !sk.get_prepared_interval().contains(&(epoch as u64)) {
-        eprintln!("Error: Could not prepare secret key for epoch {} after {} attempts. Max lifetime might be too small for this epoch.", epoch, iterations);
-        eprintln!("Total Lifetime: 2^{}", LOG_LIFETIME);
-        eprintln!("Activation: {}-{}", activation_epoch, activation_epoch + num_active_epochs);
-        eprintln!("Current Prepared: {:?}", sk.get_prepared_interval());
-        return; // Exit if preparation fails
+        return Err(format!(
+            "Could not prepare secret key for epoch {epoch}. Prepared interval is {:?}",
+            sk.get_prepared_interval()
+        ));
     }
-    println!("Secret key prepared for epoch {}. Current prepared interval: {:?}", epoch, sk.get_prepared_interval());
 
+    // Sign
+    let signature = MySigScheme::sign(&sk, epoch, &message)
+        .map_err(|e| format!("Signing failed: {e:?}"))?;
 
-    // Sign the message
-    match MySigScheme::sign(&sk, epoch, &message) {
-        Ok(signature) => {
-            // The signature type from the hashsig crate implements serde::Serialize, so
-            // use bincode's serde helper to serialize it (this does not require the
-            // `bincode::enc::Encode` trait).
-            let config = bincode::config::standard();
-            let sig_bytes = bincode::serde::encode_to_vec(&signature, config).expect("Bincode serialize should succeed");
-            let sig_size = sig_bytes.len();
-            println!("Message signed successfully. Signature serialized size: {} bytes", sig_size);
+    // Wrap signature with epoch and serialize
+    let envelope = SigEnvelope::<_> { epoch, signature };
+    let env_bytes = encode_to_vec(&envelope, config).map_err(|e| format!("Bincode serialize signature failed: {e}"))?;
+    let env_hex = hex_encode(env_bytes);
+    write_string_file(&output_path, &env_hex).map_err(|e| format!("Failed to write signature: {e}"))?;
 
-            // --- Verification ---
-            println!("\nVerifying signature...");
-            let is_valid = MySigScheme::verify(&pk, epoch, &message, &signature);
+    println!("Signature written to {}", output_path.display());
+    Ok(())
+}
 
-            if is_valid {
-                println!("Signature is VALID! ✅");
-            } else {
-                println!("Signature is INVALID! ❌");
-            }
+fn cmd_verify(signature_path: PathBuf, message_str: String, pubkey_path: PathBuf) -> Result<(), String> {
+    let config = bincode::config::standard();
 
-            // --- Tamper Test (Optional) ---
-            println!("\nTesting verification with a tampered message...");
-            let mut tampered_message = message;
-            tampered_message[0] = tampered_message[0].wrapping_add(1); // Change the first byte
-            let is_tampered_valid = MySigScheme::verify(&pk, epoch, &tampered_message, &signature);
+    // Load signature envelope (epoch + signature)
+    let sig_hex = read_string_file(&signature_path).map_err(|e| format!("Failed to read signature file: {e}"))?;
+    let sig_bytes = parse_hex(&sig_hex).map_err(|e| format!("Signature hex decode failed: {e}"))?;
+    let (envelope, _): (SigEnvelope<<MySigScheme as SignatureScheme>::Signature>, _) =
+        decode_from_slice(&sig_bytes, config).map_err(|e| format!("Bincode decode signature failed: {e}"))?;
 
-            if !is_tampered_valid {
-                println!("Verification correctly FAILED for tampered message. ✅");
-            } else {
-                println!("Verification INCORRECTLY passed for tampered message! ❌");
-            }
-        }
-        Err(e) => {
-            eprintln!("Signing failed: {:?}", e);
-        }
+    // Load public key
+    let pk_hex = read_string_file(&pubkey_path).map_err(|e| format!("Failed to read public key file: {e}"))?;
+    let pk_bytes = parse_hex(&pk_hex).map_err(|e| format!("Public key hex decode failed: {e}"))?;
+    let (pk, _): (<MySigScheme as SignatureScheme>::PublicKey, _) =
+        decode_from_slice(&pk_bytes, config).map_err(|e| format!("Bincode decode public key failed: {e}"))?;
+
+    // Prepare message
+    let message = message_to_bytes(&message_str);
+
+    // Verify
+    let valid = MySigScheme::verify(&pk, envelope.epoch, &message, &envelope.signature);
+    if valid {
+        println!("Signature is VALID");
+        Ok(())
+    } else {
+        Err("Signature is INVALID".to_string())
     }
+}
+
+fn message_to_bytes(s: &str) -> [u8; MESSAGE_LENGTH] {
+    let digest = Sha256::digest(s.as_bytes());
+    let mut out = [0u8; MESSAGE_LENGTH];
+    out.copy_from_slice(&digest[..MESSAGE_LENGTH]);
+    out
+}
+
+fn parse_hex(s: &str) -> Result<Vec<u8>, String> {
+    let trimmed = s.trim();
+    let no_prefix = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    hex_decode(no_prefix).map_err(|e| e.to_string())
+}
+
+fn read_string_file(path: &PathBuf) -> std::io::Result<String> {
+    fs::read_to_string(path)
+}
+
+fn write_string_file(path: &PathBuf, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    let mut f = fs::File::create(path)?;
+    f.write_all(content.as_bytes())?;
+    f.write_all(b"\n")?;
+    Ok(())
 }
